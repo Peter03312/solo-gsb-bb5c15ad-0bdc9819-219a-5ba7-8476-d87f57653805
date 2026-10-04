@@ -48,17 +48,24 @@ function replayTimeline(db, ctx = {}) {
     db.prepare('SELECT id, code, name FROM equipment').all().map((q) => [q.id, q])
   );
 
-  const events = db.prepare(
+  // 整页状态读取可预取事件与输入（与其余记录同事务、同一时点快照）；省略时仍按原方式查询。
+  const events = ctx.events || db.prepare(
     `SELECT id, event_time, type, equipment_id, batch_id, note, clean_allergens
        FROM events ORDER BY event_time, id`
   ).all();
 
   const inputsByEvent = new Map();
-  db.prepare('SELECT event_id, material_id, batch_id FROM process_inputs').all()
-    .forEach((r) => {
-      if (!inputsByEvent.has(r.event_id)) inputsByEvent.set(r.event_id, []);
-      inputsByEvent.get(r.event_id).push(r);
-    });
+  // ctx.inputRows 为已按事件归组的 Map；ctx.inputs 为原始行数组（至少含
+  // event_id/material_id/batch_id 三列）。二者均无则一次性全表读取。
+  if (ctx.inputRows) {
+    for (const [eid, rows] of ctx.inputRows.entries()) inputsByEvent.set(eid, rows);
+  } else {
+    (ctx.inputs || db.prepare('SELECT event_id, material_id, batch_id FROM process_inputs').all())
+      .forEach((r) => {
+        if (!inputsByEvent.has(r.event_id)) inputsByEvent.set(r.event_id, []);
+        inputsByEvent.get(r.event_id).push(r);
+      });
+  }
 
   // 设备状态：allergen -> Set<路径>
   const residue = new Map();

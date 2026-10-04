@@ -1461,6 +1461,62 @@ curl -s -X POST http://localhost:3000/api/backfills -H 'Content-Type: applicatio
 > 计量是**领用余额**口径，与过敏原推导、放行、标签卷、出货、隔离令等互不影响；
 > 计量写入与事件一样走整次事务，任何非法数量或余额不足都不会留下半成品数据。
 
+## 整页状态读取（GET /api/state，成批装配 · 同一时点）
+
+车间数据增长后，整页状态接口一次返回页面所需的全部只读数据：**原料及供应批号**（含隔离标注
+与库存摘要）、**设备与事件**（含清洗范围、清洗后残留、事件输入与补录外部记录号）、**批次放行**
+（含历史快照与失效终态）、**标签卷核销及更正链**、**出货单**（含明细快照与当前处置）、
+**质量隔离令**、**停机窗口**与**库存台账**。
+
+- **成批装配，查询数恒定**：所有关联记录都按外键一次性批量取数后在内存中归组装配——
+  供应批号、事件输入、批次放行、卷核销与更正链、出货单明细/处置、停机窗口冲突、隔离令范围
+  与库存台账均为**固定数量的 SQL**，数据库查询次数**不随事件、标签卷、核销/更正、出货单或
+  供应批号数量逐笔增长**（实测：演示库约 25 条；在其基础上把事件扩到 19、卷 21、出货单 9
+  后仍为 25 条；空库 21 条）。
+- **同一响应同一时点**：整个装配在**单个延迟（只读）事务**内完成，SQLite 提供语句级快照，
+  因此同一响应中的**核销最新有效数、可出货量、隔离状态与库存可用量**必然对应同一时点，
+  不会读到并发写入造成的中间组合。
+- **形状与语义不变**：字段、排序、历史快照以及**停用卷（RETIRED，不自动解冻）**、
+  **待评估出货单（PENDING_REVIEW，不自动恢复）**、**失效放行（INVALIDATED）**的终态语义
+  全部保持原样；**空库、无关联记录、旧输入缺数量**时仍按原形状返回（缺数量输入
+  `qty_grams=null`、`measured=false`，不计入领用、计入未计量旧输入数），归组严格按外键，
+  **不混入其他卷或批次的数据**。
+
+| 方法与路径 | 说明 |
+| --- | --- |
+| `GET /api/state` | 顶层键与各字段形状同既往；仅内部改为单事务成批装配（查询数不随数据量增长，各数量同属一个时点） |
+
+调用示例（curl）：
+
+```bash
+# 整页状态：一次取齐全部只读数据（页面与程序均直接使用该接口）
+curl -s http://localhost:3000/api/state | node -e 'let d="";process.stdin.on("data",c=>d+=c)
+  .on("end",()=>{const s=JSON.parse(d);
+    console.log("原料",s.materials.length,"批号",s.materials.flatMap(m=>m.lots).length,
+                "事件",s.events.length,"卷",s.label_rolls.length,"出货单",s.shipments.length);
+    // 同一时点自洽核对：未停用、未受控的卷可出货量 = 已贴（按各笔最新有效数合计）− 已分配
+    for (const r of s.label_rolls) {
+      const eff = r.usages.reduce((n,u)=>n+u.applied_qty,0);
+      const expect = r.status==="ACTIVE" && !r.quarantine_paused
+        ? Math.max(eff-r.allocated_qty,0) : 0;
+      if (r.shippable_qty !== expect) throw new Error("可出货量与核销/分配不一致: "+r.roll_code);
+    }
+    console.log("可出货量与核销有效数、隔离状态同一时点自洽 ✓");})'
+
+# 只看隔离令、待评估单与库存可用量
+curl -s http://localhost:3000/api/state | node -e 'let d="";process.stdin.on("data",c=>d+=c)
+  .on("end",()=>{const s=JSON.parse(d);
+    console.log("生效隔离令",s.quarantine_orders.filter(o=>o.status==="ACTIVE").length,
+                "受控批次",s.batches.filter(b=>b.quarantined).map(b=>b.code));
+    console.log("待评估单",s.shipments.filter(x=>x.pending_review).map(x=>x.shipment_code));
+    for (const l of s.lot_inventory.filter(x=>x.metered))
+      console.log(l.material_code,l.lot_code,"可用",l.available_qty,
+        "= 期初",l.opening_qty,"+ 入库",l.inbound_qty,"- 领用",l.used_qty);})'
+```
+
+端到端验证：`npm run test:state-read`（真实服务 + 临时库，用语句计数断言查询数不随数据量增长，
+并校验同一时点自洽、空库形状、归组不串卷/批、终态与排序）。
+
 ## 一键启动（Docker，从空环境开始）
 
 要求安装 Docker 与 Docker Compose（v2）。在项目目录执行：
@@ -1505,6 +1561,7 @@ npm run test:backfill     # 端到端验证断网日志整包补录：整包事�
 npm run test:downtime     # 端到端验证设备检修停机窗口：登记/调整/取消/查询、左闭右开与相邻允许、覆盖事件整次拒绝、事件/补录/换线核对、幂等重试优先、停机不等于清洗
 npm run test:quarantine   # 端到端验证质量隔离令：签发/解除/重复拒绝、生效范围（确定命中+批号未知无法排除）与传播依据、受控约束（放行/卷/出货/暂停贴用/读侧可出货量统一为 0）、待评估与需重评级联、隔离期间只能召回、范围同步刷新、解除后恢复（余额按未停用卷剩余已贴量恢复，停用卷恒 0）
 npm run test:inventory    # 端到端验证批号库存计量（克）：期初一次非负整数/入库唯一单号正整数/流水只增不改、已计量批号输入必填正整数克数且累计领用≤期初+入库、未启用批号沿用旧规则、旧输入缺数量保留不计领用且更正须补量、事件更正/删除/补录/换线确认同事务重算余额不足整次拒绝、换线预演只展示不占用、补录重试/复用不重复领用、台账查询字段
+npm run test:state-read   # 端到端验证整页状态读取：成批装配查询数恒定（不随数据量增长）、单事务同一时点、空库/旧输入原形状、归组不串卷批、终态与排序
 ```
 
 ## 访问地址与端口
@@ -1591,6 +1648,7 @@ server/
   replan.js      # 整组换线：影子库预演、业务版本签名令牌、事务确认应用（update/insert_clean 支持 clean_allergens 清洗范围；update 支持 material_inputs 带批号与克数；预演 diff.lot_inventory 只展示批号余额差异不占用库存）
   seed.js        # 首次启动演示数据（含供应批号、同原料多批号投料、一卷演示标签卷与一张演示出货单、两个相邻检修停机窗口）
   server.js      # Express API 与静态页面（含 /api/material-lots、/api/trace/material-lot、/api/label-rolls、/api/shipments、/api/replan/preview|apply、/api/shipments/:id/evaluation|dispositions、/api/backfills 补录与对账、/api/downtime-windows 停机窗口、/api/quarantine-orders 质量隔离令、/api/material-lots/:id/opening-balance|inbound|inventory 与 /api/lot-inventory 批号库存计量）
+  state.js       # 整页状态 GET /api/state：单延迟只读事务内成批装配全部关联记录（固定查询数、不随数据量增长），同一时点返回核销有效数/可出货量/隔离状态/库存可用量；字段、排序、历史快照与终态语义不变
 public/
   index.html  styles.css  app.js
 scripts/
@@ -1605,5 +1663,6 @@ scripts/
   test-downtime.js   # 设备检修停机窗口：登记/调整/取消/查询、重叠与相邻、覆盖事件整次拒绝、事件/补录/换线核对、幂等重试优先、停机不等于清洗 端到端测试
   test-quarantine.js # 质量隔离令：签发/解除/重复拒绝、生效范围与传播依据、受控约束、待评估与需重评级联、隔离期间只能召回、范围同步刷新、解除后恢复 端到端测试
   test-inventory.js  # 批号库存计量（克）：期初/入库/非法与重复拒绝、必填正整数克数与累计领用余额、旧输入补量、更正删除补录换线同事务重算与预演不占用、重试复用不重复领用、台账查询 端到端测试
+  test-state-read.js # 整页状态读取：SQL 查询计数不随事件/卷/核销/出货单/批号数量增长、单事务同一时点（核销有效数/可出货量/隔离/库存自洽）、空库与旧输入缺数量原形状、归组不串卷批、终态与排序 端到端测试
 Dockerfile  docker-compose.yml
 ```

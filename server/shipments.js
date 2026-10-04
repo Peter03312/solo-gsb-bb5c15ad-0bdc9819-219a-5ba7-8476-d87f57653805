@@ -339,48 +339,8 @@ function listShipments(db, { batch_id = null, status = null } = {}) {
   return db.prepare(sql).all(...args).map((s) => formatShipment(s, db));
 }
 
-function formatShipment(s, db) {
-  if (!s) return null;
-  const items = db
-    ? db.prepare(
-      `SELECT id, roll_id, roll_code, release_id, release_at, release_by,
-              allergen_set, roll_revision, qty
-         FROM shipment_items WHERE shipment_id = ? ORDER BY id`
-    ).all(s.id).map((it) => ({
-      id: it.id,
-      roll_id: it.roll_id,
-      roll_code: it.roll_code,
-      release_id: it.release_id,
-      release_at: it.release_at,
-      release_by: it.release_by,
-      allergens: JSON.parse(it.allergen_set || '[]'),
-      roll_revision: it.roll_revision,
-      qty: it.qty
-    }))
-    : [];
-  let currentDisposition = null;
-  let dispositionCount = 0;
-  if (db) {
-    const rows = db.prepare(
-      'SELECT * FROM shipment_dispositions WHERE shipment_id = ? ORDER BY id DESC'
-    ).all(s.id);
-    dispositionCount = rows.length;
-    if (rows.length) {
-      const d = rows[0];
-      currentDisposition = {
-        id: d.id,
-        decision: d.decision,
-        decision_text: d.decision === 'CONTINUE' ? '准予继续流转' : '召回',
-        decided_by: d.decided_by,
-        basis: d.basis,
-        life_status: d.life_status,
-        active: d.life_status === 'ACTIVE',
-        needs_review: d.life_status === 'STALE',
-        stale_reason: d.stale_reason || '',
-        decided_at: d.decided_at
-      };
-    }
-  }
+function formatShipmentRow(s, { items = [], currentDisposition = null, dispositionCount = 0,
+  batchQuarantined = false } = {}) {
   return {
     id: s.id,
     shipment_code: s.shipment_code,
@@ -393,7 +353,7 @@ function formatShipment(s, db) {
     pending_review: s.status === 'PENDING_REVIEW',
     review_reason: s.review_reason || '',
     // 批次当前是否处于质量隔离令生效范围（隔离期间只能登记召回）。
-    batch_quarantined: db ? require('./quarantine').isBatchControlled(db, s.batch_id) : false,
+    batch_quarantined: batchQuarantined,
     shipped_at: s.shipped_at,
     shipped_by: s.shipped_by,
     created_at: s.created_at,
@@ -401,6 +361,83 @@ function formatShipment(s, db) {
     disposition_count: dispositionCount,
     items
   };
+}
+
+function formatItemRow(it) {
+  return {
+    id: it.id,
+    roll_id: it.roll_id,
+    roll_code: it.roll_code,
+    release_id: it.release_id,
+    release_at: it.release_at,
+    release_by: it.release_by,
+    allergens: JSON.parse(it.allergen_set || '[]'),
+    roll_revision: it.roll_revision,
+    qty: it.qty
+  };
+}
+
+function formatDispositionRow(d) {
+  return {
+    id: d.id,
+    decision: d.decision,
+    decision_text: d.decision === 'CONTINUE' ? '准予继续流转' : '召回',
+    decided_by: d.decided_by,
+    basis: d.basis,
+    life_status: d.life_status,
+    active: d.life_status === 'ACTIVE',
+    needs_review: d.life_status === 'STALE',
+    stale_reason: d.stale_reason || '',
+    decided_at: d.decided_at
+  };
+}
+
+// 成批装配出货单：固定 3 条查询（全部明细 + 全部处置 + 全部受控批次集合），
+// 不随出货单/明细/处置数量逐笔增长；可选 controlledBatchIds 复用整页状态已取的隔离范围。
+function formatShipmentsBulk(db, rows, { controlledBatchIds = null } = {}) {
+  if (!rows || rows.length === 0) return [];
+  const ids = rows.map((s) => s.id);
+  const placeholder = ids.map(() => '?').join(',');
+  const itemsById = new Map(ids.map((id) => [id, []]));
+  db.prepare(
+    `SELECT id, shipment_id, roll_id, roll_code, release_id, release_at, release_by,
+            allergen_set, roll_revision, qty
+       FROM shipment_items
+      WHERE shipment_id IN (${placeholder})
+      ORDER BY shipment_id, id`
+  ).all(...ids).forEach((it) => itemsById.get(it.shipment_id).push(formatItemRow(it)));
+
+  const dispById = new Map();
+  db.prepare(
+    `SELECT * FROM shipment_dispositions
+      WHERE shipment_id IN (${placeholder})
+      ORDER BY shipment_id, id DESC`
+  ).all(...ids).forEach((d) => {
+    if (!dispById.has(d.shipment_id)) dispById.set(d.shipment_id, []);
+    dispById.get(d.shipment_id).push(d);
+  });
+
+  let controlled = controlledBatchIds;
+  if (controlled === null) {
+    const quarantine = require('./quarantine');
+    controlled = new Set(quarantine.controlledBatchIds(db));
+  }
+
+  return rows.map((s) => {
+    const dispRows = dispById.get(s.id) || [];
+    return formatShipmentRow(s, {
+      items: itemsById.get(s.id) || [],
+      currentDisposition: dispRows.length ? formatDispositionRow(dispRows[0]) : null,
+      dispositionCount: dispRows.length,
+      batchQuarantined: s.batch_id != null && controlled.has(s.batch_id)
+    });
+  });
+}
+
+function formatShipment(s, db) {
+  if (!s) return null;
+  if (!db) return formatShipmentRow(s);
+  return formatShipmentsBulk(db, [s])[0];
 }
 
 // ---------- 批次可出货余额 ----------
@@ -467,6 +504,7 @@ module.exports = {
   getShipmentByCode,
   listShipments,
   formatShipment,
+  formatShipmentsBulk,
   batchBalance,
   allBalances
 };

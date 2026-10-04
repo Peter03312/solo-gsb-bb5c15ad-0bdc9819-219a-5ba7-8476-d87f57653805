@@ -464,11 +464,12 @@ function formatCorrection(c) {
 }
 
 // 一笔核销流水：原始数量、最新有效数量（取最后一次更正目标）与更正链（只增不改）。
-function formatUsage(db, u) {
+// correctionsRows 可由整页状态读取一次性预取（按 usage 归组），缺省时按原方式逐笔查询。
+function formatUsage(db, u, correctionsRows) {
   if (!u) return null;
-  const corrections = db.prepare(
+  const corrections = (correctionsRows || (db ? db.prepare(
     `SELECT * FROM label_usage_corrections WHERE usage_id = ? ORDER BY id`
-  ).all(u.id).map(formatCorrection);
+  ).all(u.id) : [])).map(formatCorrection);
   const last = corrections.length ? corrections[corrections.length - 1] : null;
   return {
     id: u.id,
@@ -496,6 +497,31 @@ function listUsages(db, rollId) {
   return db.prepare(
     'SELECT * FROM label_roll_usages WHERE roll_id = ? ORDER BY id'
   ).all(rollId).map((u) => formatUsage(db, u));
+}
+
+// 成批装配多卷核销流水：每卷 2 条固定查询（全部流水 + 全部更正链），不随卷数/核销数/更正数增长。
+// 返回 Map<roll_id, formattedUsage[]>；correctionsRows 可省略（由内部一次性预取）。
+function listUsagesForRolls(db, rollIds) {
+  const result = new Map((rollIds || []).map((id) => [id, []]));
+  if (!rollIds || rollIds.length === 0) return result;
+  const usages = db.prepare(
+    `SELECT * FROM label_roll_usages WHERE roll_id IN (${rollIds.map(() => '?').join(',')})
+      ORDER BY roll_id, id`
+  ).all(...rollIds);
+  if (usages.length === 0) return result;
+  const usageIds = usages.map((u) => u.id);
+  const correctionsByUsage = new Map();
+  db.prepare(
+    `SELECT * FROM label_usage_corrections
+      WHERE usage_id IN (${usageIds.map(() => '?').join(',')}) ORDER BY usage_id, id`
+  ).all(...usageIds).forEach((c) => {
+    if (!correctionsByUsage.has(c.usage_id)) correctionsByUsage.set(c.usage_id, []);
+    correctionsByUsage.get(c.usage_id).push(c);
+  });
+  for (const u of usages) {
+    result.get(u.roll_id).push(formatUsage(db, u, correctionsByUsage.get(u.id) || []));
+  }
+  return result;
 }
 
 function formatRoll(r) {
@@ -530,6 +556,7 @@ module.exports = {
   correctUsage,
   getUsage,
   listUsages,
+  listUsagesForRolls,
   deactivateForReleaseDeletion,
   deactivateForBatchDeletion,
   syncRollsAfterRecompute,

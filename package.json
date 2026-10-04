@@ -17,7 +17,8 @@
     "test:backfill": "node scripts/test-backfill.js",
     "test:downtime": "node scripts/test-downtime.js",
     "test:quarantine": "node scripts/test-quarantine.js",
-    "test:inventory": "node scripts/test-inventory.js"
+    "test:inventory": "node scripts/test-inventory.js",
+    "test:state-read": "node scripts/test-state-read.js"
   },
   "dependencies": {
     "better-sqlite3": "^11.8.1",

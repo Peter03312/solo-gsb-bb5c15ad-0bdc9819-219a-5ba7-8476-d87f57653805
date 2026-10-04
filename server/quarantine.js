@@ -89,6 +89,22 @@ function activeOrdersByLot(db) {
   return map;
 }
 
+// 当前受控批次 id 集合（整页状态/成批出货单装配复用，同事务一次取数）。
+function controlledBatchIds(db) {
+  return new Set(db.prepare(
+    `SELECT DISTINCT qs.batch_id FROM quarantine_scope qs
+       JOIN quarantine_orders q ON q.id = qs.order_id
+      WHERE q.status = 'ACTIVE'`
+  ).all().map((r) => r.batch_id));
+}
+
+// 整页状态读取一次取数：受控批次 -> 生效令列表（按 q.id 归组）与受控批次集合。
+// 与 controlledOrdersByBatch() 同形状，但同时返回受控集合供出货单批量装配复用。
+function controlSnapshot(db) {
+  const quarByBatch = controlledOrdersByBatch(db);
+  return { quarByBatch, controlledBatchIds: new Set(quarByBatch.keys()) };
+}
+
 function describeOrders(orders) {
   return orders
     .map((o) => `${o.order_code}（${o.material_name} 批号 ${o.lot_code}）`)
@@ -375,48 +391,66 @@ function liftOrder(db, id, body) {
 }
 
 // ---------- 读取模型 ----------
-function shipmentBriefs(db, batchId) {
-  const rows = db.prepare(
-    `SELECT id, shipment_code, status, review_reason, ship_qty, shipped_at, shipped_by
-       FROM shipments WHERE batch_id = ? ORDER BY id`
-  ).all(batchId);
-  const dispStmt = db.prepare(
-    `SELECT decision, life_status, stale_reason FROM shipment_dispositions
-      WHERE shipment_id = ? ORDER BY id DESC LIMIT 1`
-  );
-  return rows.map((s) => {
-    const d = dispStmt.get(s.id);
-    return {
-      shipment_id: s.id,
-      shipment_code: s.shipment_code,
-      status: s.status,
-      pending_review: s.status === 'PENDING_REVIEW',
-      review_reason: s.review_reason || '',
-      ship_qty: s.ship_qty,
-      shipped_at: s.shipped_at,
-      shipped_by: s.shipped_by,
-      current_disposition: d ? {
-        decision: d.decision,
-        decision_text: d.decision === 'CONTINUE' ? '准予继续流转' : '召回',
-        life_status: d.life_status,
-        needs_review: d.life_status === 'STALE',
-        stale_reason: d.stale_reason || ''
-      } : null
-    };
-  });
-}
+const SCOPE_BATCH_SELECT =
+  `SELECT qs.order_id, qs.batch_id, qs.classification, qs.evidence_json,
+          b.code AS batch_code, ev.event_time AS produced_at, eq.code AS equipment_code
+     FROM quarantine_scope qs
+     LEFT JOIN batches b ON b.id = qs.batch_id
+     LEFT JOIN events ev ON ev.batch_id = qs.batch_id
+     LEFT JOIN equipment eq ON eq.id = ev.equipment_id`;
 
 function scopeBatches(db, orderId, { withEvidence }) {
   const rows = db.prepare(
-    `SELECT qs.batch_id, qs.classification, qs.evidence_json,
-            b.code AS batch_code, ev.event_time AS produced_at, eq.code AS equipment_code
-       FROM quarantine_scope qs
-       LEFT JOIN batches b ON b.id = qs.batch_id
-       LEFT JOIN events ev ON ev.batch_id = qs.batch_id
-       LEFT JOIN equipment eq ON eq.id = ev.equipment_id
-      WHERE qs.order_id = ?
-      ORDER BY ev.event_time, qs.batch_id`
+    `${SCOPE_BATCH_SELECT} WHERE qs.order_id = ? ORDER BY ev.event_time, qs.batch_id`
   ).all(orderId);
+  return scopeRowsToModel(db, rows, withEvidence);
+}
+
+// 范围行 -> 展示模型（与 scopeBatches 输出逐项同形状；withEvidence 时关联出货单）。
+function scopeRowsToModel(db, rows, withEvidence) {
+  // 关联出货单成批装配（withEvidence 时固定 2 条查询，不随令/批/单数量增长）。
+  let briefsByBatch = null;
+  if (withEvidence && rows.length) {
+    const batchIds = [...new Set(rows.map((r) => r.batch_id))];
+    const ph = batchIds.map(() => '?').join(',');
+    const shipRows = db.prepare(
+      `SELECT id, batch_id, shipment_code, status, review_reason, ship_qty, shipped_at, shipped_by
+         FROM shipments WHERE batch_id IN (${ph}) ORDER BY id`
+    ).all(...batchIds);
+    const shipIds = shipRows.map((s) => s.id);
+    const dispById = new Map();
+    if (shipIds.length) {
+      db.prepare(
+        `SELECT shipment_id, decision, life_status, stale_reason
+           FROM shipment_dispositions
+          WHERE shipment_id IN (${shipIds.map(() => '?').join(',')})
+          ORDER BY shipment_id, id DESC`
+      ).all(...shipIds).forEach((d) => {
+        if (!dispById.has(d.shipment_id)) dispById.set(d.shipment_id, d);
+      });
+    }
+    briefsByBatch = new Map(batchIds.map((id) => [id, []]));
+    for (const s of shipRows) {
+      const d = dispById.get(s.id);
+      briefsByBatch.get(s.batch_id).push({
+        shipment_id: s.id,
+        shipment_code: s.shipment_code,
+        status: s.status,
+        pending_review: s.status === 'PENDING_REVIEW',
+        review_reason: s.review_reason || '',
+        ship_qty: s.ship_qty,
+        shipped_at: s.shipped_at,
+        shipped_by: s.shipped_by,
+        current_disposition: d ? {
+          decision: d.decision,
+          decision_text: d.decision === 'CONTINUE' ? '准予继续流转' : '召回',
+          life_status: d.life_status,
+          needs_review: d.life_status === 'STALE',
+          stale_reason: d.stale_reason || ''
+        } : null
+      });
+    }
+  }
   return rows.map((r) => {
     const base = {
       batch_id: r.batch_id,
@@ -431,12 +465,15 @@ function scopeBatches(db, orderId, { withEvidence }) {
     return {
       ...base,
       evidence, // 传播依据：confirmed/unresolved 各自的链、途径与截断标记
-      shipments: shipmentBriefs(db, r.batch_id)
+      shipments: (briefsByBatch.get(r.batch_id) || [])
+        .slice()
+        // shipmentBriefs 原按单批 ORDER BY id；跨批装配后在此恢复同批内顺序。
+        .sort((a, b) => a.shipment_id - b.shipment_id)
     };
   });
 }
 
-function formatOrder(row, db, { withEvidence = false } = {}) {
+function formatOrder(row, db, { withEvidence = false } = {}, scopeModel = undefined) {
   const active = row.status === 'ACTIVE';
   const order = {
     id: row.id,
@@ -457,7 +494,10 @@ function formatOrder(row, db, { withEvidence = false } = {}) {
     created_at: row.created_at
   };
   if (active) {
-    const batches = scopeBatches(db, row.id, { withEvidence });
+    // 成批列表（listOrders）传入已装配好的 scopeModel；单条查询仍走 scopeBatches。
+    const batches = scopeModel !== undefined
+      ? scopeModel
+      : scopeBatches(db, row.id, { withEvidence });
     const affected = withEvidence
       ? batches.flatMap((b) => b.shipments.map((s) => ({
         ...s, batch_id: b.batch_id, batch_code: b.batch_code
@@ -492,6 +532,7 @@ function getOrder(db, id, { withEvidence = true } = {}) {
 }
 
 // 列表：?status=ACTIVE|LIFTED、?lot_id= 过滤；范围只带批次清单（传播依据见单条查询）。
+// 生效令范围一次性成批取数并按令归组，查询数不随隔离令数量增长。
 function listOrders(db, { status = null, lot_id = null } = {}) {
   let sql = ORDER_SELECT;
   const args = [];
@@ -500,8 +541,25 @@ function listOrders(db, { status = null, lot_id = null } = {}) {
   if (lot_id != null) { where.push('q.lot_id = ?'); args.push(lot_id); }
   if (where.length) sql += ' WHERE ' + where.join(' AND ');
   sql += ' ORDER BY q.id';
-  return db.prepare(sql).all(...args)
-    .map((row) => formatOrder(row, db, { withEvidence: false }));
+  const rows = db.prepare(sql).all(...args);
+
+  // 一次性取全部列表中生效令的范围行（按 produced_at,batch_id 排序，逐令切片）。
+  const activeIds = rows.filter((r) => r.status === 'ACTIVE').map((r) => r.id);
+  const scopeByOrder = new Map(activeIds.map((id) => [id, []]));
+  if (activeIds.length) {
+    const ph = activeIds.map(() => '?').join(',');
+    db.prepare(
+      `${SCOPE_BATCH_SELECT} WHERE qs.order_id IN (${ph})
+        ORDER BY qs.order_id, ev.event_time, qs.batch_id`
+    ).all(...activeIds).forEach((r) => scopeByOrder.get(r.order_id).push(r));
+  }
+
+  return rows.map((row) => formatOrder(
+    row, db, { withEvidence: false },
+    row.status === 'ACTIVE'
+      ? scopeRowsToModel(db, scopeByOrder.get(row.id) || [], false)
+      : undefined
+  ));
 }
 
 module.exports = {
@@ -514,6 +572,8 @@ module.exports = {
   batchOrders,
   isBatchControlled,
   controlledOrdersByBatch,
+  controlledBatchIds,
+  controlSnapshot,
   activeOrdersByLot,
   describeOrders
 };

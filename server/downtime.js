@@ -236,7 +236,7 @@ function getWindowOrThrow(db, id) {
   return w;
 }
 
-function listWindows(db, { equipment_id = null } = {}) {
+function listWindows(db, { equipment_id = null, allEvents = null } = {}) {
   let sql = WINDOW_SQL;
   const args = [];
   if (equipment_id != null) {
@@ -244,7 +244,19 @@ function listWindows(db, { equipment_id = null } = {}) {
     args.push(equipment_id);
   }
   sql += ' ORDER BY w.start_time, w.id';
-  return db.prepare(sql).all(...args).map((row) =>
+  const rows = db.prepare(sql).all(...args);
+  // 整页状态读取可把已预取的全部事件（含 batch_code，按 event_time,id 排序）经
+  // allEvents 传入复用，窗口冲突在内存过滤、不再每窗口查询；省略时仍按原方式逐窗查询。
+  if (allEvents) {
+    const conflictRows = allEvents;
+    return rows.map((row) => formatWindow(row,
+      conflictRows
+        .filter((ev) => ev.equipment_id === row.equipment_id &&
+          normTime(ev.event_time) >= normTime(row.start_time) &&
+          normTime(ev.event_time) < normTime(row.end_time))
+        .map((ev) => formatConflictEvent(ev, { code: row.equipment_code }))));
+  }
+  return rows.map((row) =>
     formatWindow(row, findEventConflicts(db, row.equipment_id, row.start_time, row.end_time)
       .map((ev) => formatConflictEvent(ev, { code: row.equipment_code }))));
 }

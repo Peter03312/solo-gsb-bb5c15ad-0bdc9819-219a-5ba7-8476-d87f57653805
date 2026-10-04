@@ -154,17 +154,104 @@ function lotBalance(db, lotId) {
 }
 
 // 全部批号台账（按原料/批号排序）。
+// 成批装配：固定少量查询（批号档案/期初/入库/领用/未计量/总未计量），
+// 不随供应批号或旧输入数量逐笔增长；输出逐项与 lotBalance 同形状、同排序。
 function allBalances(db) {
-  const lots = db.prepare('SELECT id FROM material_lots ORDER BY id').all();
-  const lotBalances = lots.map((r) => lotBalance(db, r.id));
-  lotBalances.sort((a, b) =>
-    a.material_code.localeCompare(b.material_code, 'zh') ||
-    a.lot_code.localeCompare(b.lot_code, 'zh'));
+  const lotRows = db.prepare(
+    `SELECT l.id AS lot_id, l.lot_code, l.material_id,
+            m.code AS material_code, m.name AS material_name
+       FROM material_lots l JOIN materials m ON m.id = l.material_id`
+  ).all();
+
+  const openings = new Map(
+    db.prepare(
+      `SELECT id, lot_id, quantity_grams, registered_by, registered_at, note, created_at
+         FROM lot_opening_balances`
+    ).all().map((o) => [o.lot_id, o])
+  );
+
+  const inboundRows = db.prepare(
+    `SELECT id, receipt_code, lot_id, quantity_grams, received_by, received_at, note, created_at
+       FROM lot_inbound_receipts ORDER BY lot_id, id`
+  ).all();
+  const inboundByLot = new Map();
+  for (const r of inboundRows) {
+    if (!inboundByLot.has(r.lot_id)) inboundByLot.set(r.lot_id, []);
+    inboundByLot.get(r.lot_id).push(r);
+  }
+
+  // 按批号累计领用（缺数量的旧输入不计）；无领用记录的批号按 0。
+  const usedByLot = new Map(
+    db.prepare(
+      `SELECT pi.material_lot_id AS lot_id, COALESCE(SUM(pi.qty_grams),0) AS used_qty
+         FROM process_inputs pi JOIN events ev ON ev.id = pi.event_id
+        WHERE pi.material_lot_id IS NOT NULL AND pi.qty_grams IS NOT NULL
+        GROUP BY pi.material_lot_id`
+    ).all().map((r) => [r.lot_id, r.used_qty])
+  );
+
+  // 未计量旧输入数：引用该批号但缺克数的原料输入行数。
+  const unmeasuredByLot = new Map(
+    db.prepare(
+      `SELECT material_lot_id AS lot_id, COUNT(*) AS c
+         FROM process_inputs
+        WHERE material_lot_id IS NOT NULL AND qty_grams IS NULL
+        GROUP BY material_lot_id`
+    ).all().map((r) => [r.lot_id, r.c])
+  );
+
   // 全部“缺少数量的原料输入”：未启用批号的输入 + 已启用批号启用前的旧输入 + 批号未知输入。
   const unmeasuredTotal = db.prepare(
     `SELECT COUNT(*) AS c FROM process_inputs
       WHERE material_id IS NOT NULL AND qty_grams IS NULL`
   ).get().c;
+
+  const lotBalances = lotRows.map((lot) => {
+    const opening = openings.get(lot.lot_id) || null;
+    const inboundRowsOfLot = inboundByLot.get(lot.lot_id) || [];
+    const opening_qty = opening ? opening.quantity_grams : null;
+    const inbound_qty = opening
+      ? inboundRowsOfLot.reduce((s, r) => s + r.quantity_grams, 0)
+      : null;
+    const used_qty = opening ? (usedByLot.get(lot.lot_id) || 0) : 0;
+    return {
+      lot_id: lot.lot_id,
+      lot_code: lot.lot_code,
+      material_id: lot.material_id,
+      material_code: lot.material_code,
+      material_name: lot.material_name,
+      metered: opening !== null,
+      opening_qty,                                   // 期初（未启用为 null）
+      inbound_qty,                                   // 入库合计（未启用为 null）
+      used_qty,                                      // 领用合计（旧输入不计入）
+      available_qty: opening
+        ? opening.quantity_grams + inbound_qty - used_qty
+        : null,                                      // 可用量（未启用为 null）
+      unmeasured_input_count: unmeasuredByLot.get(lot.lot_id) || 0,
+      opening: opening ? {
+        id: opening.id,
+        quantity_grams: opening.quantity_grams,
+        registered_by: opening.registered_by,
+        registered_at: opening.registered_at,
+        note: opening.note,
+        created_at: opening.created_at
+      } : null,
+      inbound: inboundRowsOfLot.map((r) => ({
+        id: r.id,
+        receipt_code: r.receipt_code,
+        quantity_grams: r.quantity_grams,
+        received_by: r.received_by,
+        received_at: r.received_at,
+        note: r.note,
+        created_at: r.created_at
+      })),
+      inbound_count: inboundRowsOfLot.length
+    };
+  });
+  lotBalances.sort((a, b) =>
+    a.material_code.localeCompare(b.material_code, 'zh') ||
+    a.lot_code.localeCompare(b.lot_code, 'zh'));
+
   return {
     lots: lotBalances,
     summary: {
