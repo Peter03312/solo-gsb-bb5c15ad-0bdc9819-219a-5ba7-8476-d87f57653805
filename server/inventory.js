@@ -109,15 +109,35 @@ function unmeasuredCount(db, lotId) {
   ).get(lotId).c;
 }
 
-// ---------- 单批号台账 ----------
-function lotBalance(db, lotId) {
-  const lot = getLotRow(db, lotId);
-  if (!lot) return null;
-  const opening = getOpening(db, lotId);
-  const inboundRows = listInbound(db, lotId);
+// ---------- 台账读取模型 ----------
+function formatOpening(o) {
+  return o ? {
+    id: o.id,
+    quantity_grams: o.quantity_grams,
+    registered_by: o.registered_by,
+    registered_at: o.registered_at,
+    note: o.note,
+    created_at: o.created_at
+  } : null;
+}
+
+function formatInbound(r) {
+  return {
+    id: r.id,
+    receipt_code: r.receipt_code,
+    quantity_grams: r.quantity_grams,
+    received_by: r.received_by,
+    received_at: r.received_at,
+    note: r.note,
+    created_at: r.created_at
+  };
+}
+
+// 单批号台账（写入后回读用）。
+function lotBalanceFromRow(lot, opening, inboundRows, usedQty, unmeasured) {
   const opening_qty = opening ? opening.quantity_grams : null;
-  const inbound_qty = inboundRows.reduce((s, r) => s + r.quantity_grams, 0);
-  const used_qty = opening ? usedTotal(db, lotId) : 0;
+  const inbound_qty = opening ? inboundRows.reduce((s, r) => s + r.quantity_grams, 0) : null;
+  const used_qty = opening ? usedQty : 0;
   return {
     lot_id: lot.id,
     lot_code: lot.lot_code,
@@ -131,32 +151,72 @@ function lotBalance(db, lotId) {
     available_qty: opening
       ? opening.quantity_grams + inbound_qty - used_qty
       : null,                                     // 可用量（未启用为 null）
-    unmeasured_input_count: unmeasuredCount(db, lotId),
-    opening: opening ? {
-      id: opening.id,
-      quantity_grams: opening.quantity_grams,
-      registered_by: opening.registered_by,
-      registered_at: opening.registered_at,
-      note: opening.note,
-      created_at: opening.created_at
-    } : null,
-    inbound: inboundRows.map((r) => ({
-      id: r.id,
-      receipt_code: r.receipt_code,
-      quantity_grams: r.quantity_grams,
-      received_by: r.received_by,
-      received_at: r.received_at,
-      note: r.note,
-      created_at: r.created_at
-    })),
+    unmeasured_input_count: unmeasured,
+    opening: formatOpening(opening),
+    inbound: inboundRows.map(formatInbound),
     inbound_count: inboundRows.length
   };
 }
 
+// ---------- 单批号台账 ----------
+function lotBalance(db, lotId) {
+  const lot = getLotRow(db, lotId);
+  if (!lot) return null;
+  const opening = getOpening(db, lotId);
+  const inboundRows = listInbound(db, lotId);
+  const usedQty = opening ? usedTotal(db, lotId) : 0;
+  return lotBalanceFromRow(lot, opening, inboundRows, usedQty, unmeasuredCount(db, lotId));
+}
+
 // 全部批号台账（按原料/批号排序）。
+// 成批取数：批号档案、期初、入库、按批号领用与未计量输入各一条 SQL，
+// 查询数固定（不随供应批号数量逐笔增长）；输出形状与逐批号 lotBalance 完全一致。
 function allBalances(db) {
-  const lots = db.prepare('SELECT id FROM material_lots ORDER BY id').all();
-  const lotBalances = lots.map((r) => lotBalance(db, r.id));
+  const lotRows = db.prepare(
+    `SELECT l.id, l.lot_code, l.material_id, m.code AS material_code, m.name AS material_name
+       FROM material_lots l JOIN materials m ON m.id = l.material_id
+      ORDER BY l.id`
+  ).all();
+  const openingByLot = new Map(
+    db.prepare(
+      `SELECT id, lot_id, quantity_grams, registered_by, registered_at, note, created_at
+         FROM lot_opening_balances`
+    ).all().map((o) => [o.lot_id, o])
+  );
+  const inboundByLot = new Map();
+  db.prepare(
+    `SELECT id, receipt_code, lot_id, quantity_grams, received_by, received_at, note, created_at
+       FROM lot_inbound_receipts ORDER BY id`
+  ).all().forEach((r) => {
+    if (!inboundByLot.has(r.lot_id)) inboundByLot.set(r.lot_id, []);
+    inboundByLot.get(r.lot_id).push(r);
+  });
+  // 已计量领用按批号合计（仅统计填写了克数的输入；旧输入 NULL 不计入）。
+  const usedByLot = new Map(
+    db.prepare(
+      `SELECT pi.material_lot_id AS lot_id, COALESCE(SUM(pi.qty_grams),0) AS total
+         FROM process_inputs pi JOIN events ev ON ev.id = pi.event_id
+        WHERE pi.material_lot_id IS NOT NULL AND pi.qty_grams IS NOT NULL
+        GROUP BY pi.material_lot_id`
+    ).all().map((r) => [r.lot_id, r.total])
+  );
+  // 未计量旧输入按批号计数（引用该批号但缺少克数的原料输入行）。
+  const unmeasuredByLot = new Map(
+    db.prepare(
+      `SELECT material_lot_id AS lot_id, COUNT(*) AS c
+         FROM process_inputs
+        WHERE material_lot_id IS NOT NULL AND qty_grams IS NULL
+        GROUP BY material_lot_id`
+    ).all().map((r) => [r.lot_id, r.c])
+  );
+
+  const lotBalances = lotRows.map((lot) => lotBalanceFromRow(
+    lot,
+    openingByLot.get(lot.id) || null,
+    inboundByLot.get(lot.id) || [],
+    usedByLot.get(lot.id) || 0,
+    unmeasuredByLot.get(lot.id) || 0
+  ));
   lotBalances.sort((a, b) =>
     a.material_code.localeCompare(b.material_code, 'zh') ||
     a.lot_code.localeCompare(b.lot_code, 'zh'));

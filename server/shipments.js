@@ -336,71 +336,131 @@ function listShipments(db, { batch_id = null, status = null } = {}) {
     args.push(status);
   }
   sql += ' ORDER BY id DESC';
-  return db.prepare(sql).all(...args).map((s) => formatShipment(s, db));
+  return formatShipmentsBulk(db.prepare(sql).all(...args), db);
+}
+
+function formatShipmentItem(it) {
+  return {
+    id: it.id,
+    roll_id: it.roll_id,
+    roll_code: it.roll_code,
+    release_id: it.release_id,
+    release_at: it.release_at,
+    release_by: it.release_by,
+    allergens: JSON.parse(it.allergen_set || '[]'),
+    roll_revision: it.roll_revision,
+    qty: it.qty
+  };
+}
+
+function formatCurrentDisposition(d) {
+  return {
+    id: d.id,
+    decision: d.decision,
+    decision_text: d.decision === 'CONTINUE' ? '准予继续流转' : '召回',
+    decided_by: d.decided_by,
+    basis: d.basis,
+    life_status: d.life_status,
+    active: d.life_status === 'ACTIVE',
+    needs_review: d.life_status === 'STALE',
+    stale_reason: d.stale_reason || '',
+    decided_at: d.decided_at
+  };
+}
+
+// 出货单列表成批装配：明细、处置结论与隔离状态各一条 SQL（或复用整页状态已取的受控集合），
+// 查询数不随出货单数量逐笔增长；每单形状与 formatShipment 逐单结果完全一致。
+// controlledBatchIds 可选：整页状态传入与隔离令同一时点取得的受控批次集合，
+// 保证同一响应中“隔离状态”与核销有效数、可出货量、库存可用量对应同一时点。
+function formatShipmentsBulk(rows, db, { controlledBatchIds = null } = {}) {
+  if (!rows.length) return [];
+  const ids = rows.map((s) => s.id);
+  const placeholders = ids.map(() => '?').join(',');
+
+  const itemsByShipment = new Map();
+  db.prepare(
+    `SELECT id, shipment_id, roll_id, roll_code, release_id, release_at, release_by,
+            allergen_set, roll_revision, qty
+       FROM shipment_items WHERE shipment_id IN (${placeholders}) ORDER BY id`
+  ).all(...ids).forEach((it) => {
+    if (!itemsByShipment.has(it.shipment_id)) itemsByShipment.set(it.shipment_id, []);
+    itemsByShipment.get(it.shipment_id).push(formatShipmentItem(it));
+  });
+
+  // 每单最新处置：按 id 倒序取首条（与逐单 ORDER BY id DESC 一致）。
+  const dispositions = db.prepare(
+    `SELECT * FROM shipment_dispositions WHERE shipment_id IN (${placeholders}) ORDER BY id DESC`
+  ).all(...ids);
+  const latestByShipment = new Map();
+  for (const d of dispositions) {
+    if (!latestByShipment.has(d.shipment_id)) latestByShipment.set(d.shipment_id, d);
+  }
+  const countByShipment = new Map();
+  for (const d of dispositions) {
+    countByShipment.set(d.shipment_id, (countByShipment.get(d.shipment_id) || 0) + 1);
+  }
+
+  // 隔离状态：默认按预取集合判定；缺省时整体一次查询受控批次。
+  let controlled = controlledBatchIds;
+  if (controlled === null) {
+    controlled = new Set(db.prepare(
+      `SELECT DISTINCT qs.batch_id AS batch_id
+         FROM quarantine_scope qs
+         JOIN quarantine_orders q ON q.id = qs.order_id
+        WHERE q.status = 'ACTIVE'`
+    ).all().map((r) => r.batch_id));
+  }
+
+  return rows.map((s) => {
+    const items = itemsByShipment.get(s.id) || [];
+    const latest = latestByShipment.get(s.id) || null;
+    return {
+      id: s.id,
+      shipment_code: s.shipment_code,
+      batch_id: s.batch_id,
+      batch_code: s.batch_code,
+      ship_qty: s.ship_qty,
+      allocated_qty: items.reduce((n, it) => n + it.qty, 0),
+      allergens: JSON.parse(s.allergen_set || '[]'),
+      status: s.status,
+      pending_review: s.status === 'PENDING_REVIEW',
+      review_reason: s.review_reason || '',
+      // 批次当前是否处于质量隔离令生效范围（隔离期间只能登记召回）。
+      batch_quarantined: s.batch_id != null && controlled.has(s.batch_id),
+      shipped_at: s.shipped_at,
+      shipped_by: s.shipped_by,
+      created_at: s.created_at,
+      current_disposition: latest ? formatCurrentDisposition(latest) : null,
+      disposition_count: countByShipment.get(s.id) || 0,
+      items
+    };
+  });
 }
 
 function formatShipment(s, db) {
   if (!s) return null;
-  const items = db
-    ? db.prepare(
-      `SELECT id, roll_id, roll_code, release_id, release_at, release_by,
-              allergen_set, roll_revision, qty
-         FROM shipment_items WHERE shipment_id = ? ORDER BY id`
-    ).all(s.id).map((it) => ({
-      id: it.id,
-      roll_id: it.roll_id,
-      roll_code: it.roll_code,
-      release_id: it.release_id,
-      release_at: it.release_at,
-      release_by: it.release_by,
-      allergens: JSON.parse(it.allergen_set || '[]'),
-      roll_revision: it.roll_revision,
-      qty: it.qty
-    }))
-    : [];
-  let currentDisposition = null;
-  let dispositionCount = 0;
-  if (db) {
-    const rows = db.prepare(
-      'SELECT * FROM shipment_dispositions WHERE shipment_id = ? ORDER BY id DESC'
-    ).all(s.id);
-    dispositionCount = rows.length;
-    if (rows.length) {
-      const d = rows[0];
-      currentDisposition = {
-        id: d.id,
-        decision: d.decision,
-        decision_text: d.decision === 'CONTINUE' ? '准予继续流转' : '召回',
-        decided_by: d.decided_by,
-        basis: d.basis,
-        life_status: d.life_status,
-        active: d.life_status === 'ACTIVE',
-        needs_review: d.life_status === 'STALE',
-        stale_reason: d.stale_reason || '',
-        decided_at: d.decided_at
-      };
-    }
+  if (!db) {
+    return {
+      id: s.id,
+      shipment_code: s.shipment_code,
+      batch_id: s.batch_id,
+      batch_code: s.batch_code,
+      ship_qty: s.ship_qty,
+      allocated_qty: 0,
+      allergens: JSON.parse(s.allergen_set || '[]'),
+      status: s.status,
+      pending_review: s.status === 'PENDING_REVIEW',
+      review_reason: s.review_reason || '',
+      batch_quarantined: false,
+      shipped_at: s.shipped_at,
+      shipped_by: s.shipped_by,
+      created_at: s.created_at,
+      current_disposition: null,
+      disposition_count: 0,
+      items: []
+    };
   }
-  return {
-    id: s.id,
-    shipment_code: s.shipment_code,
-    batch_id: s.batch_id,
-    batch_code: s.batch_code,
-    ship_qty: s.ship_qty,
-    allocated_qty: items.reduce((n, it) => n + it.qty, 0),
-    allergens: JSON.parse(s.allergen_set || '[]'),
-    status: s.status,
-    pending_review: s.status === 'PENDING_REVIEW',
-    review_reason: s.review_reason || '',
-    // 批次当前是否处于质量隔离令生效范围（隔离期间只能登记召回）。
-    batch_quarantined: db ? require('./quarantine').isBatchControlled(db, s.batch_id) : false,
-    shipped_at: s.shipped_at,
-    shipped_by: s.shipped_by,
-    created_at: s.created_at,
-    current_disposition: currentDisposition,
-    disposition_count: dispositionCount,
-    items
-  };
+  return formatShipmentsBulk([s], db)[0];
 }
 
 // ---------- 批次可出货余额 ----------
@@ -467,6 +527,7 @@ module.exports = {
   getShipmentByCode,
   listShipments,
   formatShipment,
+  formatShipmentsBulk,
   batchBalance,
   allBalances
 };

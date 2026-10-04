@@ -480,6 +480,46 @@ function formatOrder(row, db, { withEvidence = false } = {}) {
   return order;
 }
 
+// 令列表行 -> 读取形状（withEvidence=false）：范围批次清单整体一次预取后成批装配，
+// 单条（withEvidence=true）仍走 scopeBatches（含传播依据与关联出货单）。
+function formatOrderWithoutEvidence(row, scopeBatchesForOrder) {
+  const active = row.status === 'ACTIVE';
+  const order = {
+    id: row.id,
+    order_code: row.order_code,
+    lot_id: row.lot_id,
+    lot_code: row.lot_code,
+    material_id: row.material_id,
+    material_code: row.material_code,
+    material_name: row.material_name,
+    reason: row.reason,
+    status: row.status, // ACTIVE 生效中 / LIFTED 已解除（终态）
+    active,
+    issued_by: row.issued_by,
+    issued_at: row.issued_at,
+    lifted_by: row.lifted_by || null,
+    lifted_at: row.lifted_at || null,
+    lift_reason: row.lift_reason || '',
+    created_at: row.created_at
+  };
+  if (active) {
+    const batches = scopeBatchesForOrder || [];
+    order.scope = {
+      batch_count: batches.length,
+      confirmed_count: batches.filter((b) => b.classification === 'CONFIRMED').length,
+      unresolved_count: batches.filter((b) => b.classification === 'UNRESOLVED').length,
+      batches
+    };
+  } else {
+    // 已解除：当前范围为空；解除时范围快照留痕展示。
+    let liftedScope = [];
+    try { liftedScope = JSON.parse(row.lifted_scope_json || '[]'); } catch (_) { liftedScope = []; }
+    order.scope = { batch_count: 0, confirmed_count: 0, unresolved_count: 0, batches: [] };
+    order.lifted_scope = liftedScope;
+  }
+  return order;
+}
+
 const ORDER_SELECT =
   `SELECT q.*, l.lot_code, l.material_id, m.code AS material_code, m.name AS material_name
      FROM quarantine_orders q
@@ -491,7 +531,37 @@ function getOrder(db, id, { withEvidence = true } = {}) {
   return row ? formatOrder(row, db, { withEvidence }) : null;
 }
 
+// 全部生效令的范围批次（不带传播依据），按令分组：整页状态/令列表各一条 SQL 成批取数，
+// 查询数不随隔离令数量逐笔增长；批次排序与 scopeBatches 单令查询一致。
+function scopeBatchesBulk(db, orderIds) {
+  const byOrder = new Map();
+  if (!orderIds.length) return byOrder;
+  const placeholders = orderIds.map(() => '?').join(',');
+  const rows = db.prepare(
+    `SELECT qs.order_id, qs.batch_id, qs.classification,
+            b.code AS batch_code, ev.event_time AS produced_at, eq.code AS equipment_code
+       FROM quarantine_scope qs
+       LEFT JOIN batches b ON b.id = qs.batch_id
+       LEFT JOIN events ev ON ev.batch_id = qs.batch_id
+       LEFT JOIN equipment eq ON eq.id = ev.equipment_id
+      WHERE qs.order_id IN (${placeholders})
+      ORDER BY ev.event_time, qs.batch_id`
+  ).all(...orderIds);
+  for (const r of rows) {
+    if (!byOrder.has(r.order_id)) byOrder.set(r.order_id, []);
+    byOrder.get(r.order_id).push({
+      batch_id: r.batch_id,
+      batch_code: r.batch_code || `#${r.batch_id}`,
+      classification: r.classification, // CONFIRMED 确定命中 / UNRESOLVED 批号未知无法排除
+      produced_at: r.produced_at || null,
+      equipment_code: r.equipment_code || null
+    });
+  }
+  return byOrder;
+}
+
 // 列表：?status=ACTIVE|LIFTED、?lot_id= 过滤；范围只带批次清单（传播依据见单条查询）。
+// 令行与范围清单各一条 SQL（令数量不影响查询次数）。
 function listOrders(db, { status = null, lot_id = null } = {}) {
   let sql = ORDER_SELECT;
   const args = [];
@@ -500,8 +570,10 @@ function listOrders(db, { status = null, lot_id = null } = {}) {
   if (lot_id != null) { where.push('q.lot_id = ?'); args.push(lot_id); }
   if (where.length) sql += ' WHERE ' + where.join(' AND ');
   sql += ' ORDER BY q.id';
-  return db.prepare(sql).all(...args)
-    .map((row) => formatOrder(row, db, { withEvidence: false }));
+  const rows = db.prepare(sql).all(...args);
+  const activeIds = rows.filter((r) => r.status === 'ACTIVE').map((r) => r.id);
+  const scopes = scopeBatchesBulk(db, activeIds);
+  return rows.map((row) => formatOrderWithoutEvidence(row, scopes.get(row.id) || []));
 }
 
 module.exports = {

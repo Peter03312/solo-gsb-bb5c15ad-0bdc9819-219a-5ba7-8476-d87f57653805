@@ -244,9 +244,34 @@ function listWindows(db, { equipment_id = null } = {}) {
     args.push(equipment_id);
   }
   sql += ' ORDER BY w.start_time, w.id';
-  return db.prepare(sql).all(...args).map((row) =>
-    formatWindow(row, findEventConflicts(db, row.equipment_id, row.start_time, row.end_time)
-      .map((ev) => formatConflictEvent(ev, { code: row.equipment_code }))));
+  const rows = db.prepare(sql).all(...args);
+  return formatWindowsBulk(db, rows);
+}
+
+// 窗口列表成批装配：相关设备的事件只取一次，在内存按各窗口的左闭右开区间过滤，
+// 查询数不随窗口数量逐笔增长；结果与逐窗口 findEventConflicts 完全一致。
+function formatWindowsBulk(db, rows) {
+  if (!rows.length) return [];
+  const equipmentIds = [...new Set(rows.map((r) => r.equipment_id))];
+  const placeholders = equipmentIds.map(() => '?').join(',');
+  const events = db.prepare(
+    `SELECT ev.id, ev.event_time, ev.type, ev.equipment_id, ev.note, b.code AS batch_code
+       FROM events ev LEFT JOIN batches b ON b.id = ev.batch_id
+      WHERE ev.equipment_id IN (${placeholders})
+      ORDER BY ev.event_time, ev.id`
+  ).all(...equipmentIds);
+  return rows.map((row) => {
+    const s = normTime(row.start_time);
+    const e = normTime(row.end_time);
+    const conflicts = events
+      .filter((ev) => ev.equipment_id === row.equipment_id)
+      .filter((ev) => {
+        const t = normTime(ev.event_time);
+        return t >= s && t < e;
+      })
+      .map((ev) => formatConflictEvent(ev, { code: row.equipment_code }));
+    return formatWindow(row, conflicts);
+  });
 }
 
 // ---------- 全量校验用：事件是否落入停机窗口 ----------

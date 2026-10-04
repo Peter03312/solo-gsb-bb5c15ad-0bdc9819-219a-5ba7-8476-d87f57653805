@@ -464,11 +464,15 @@ function formatCorrection(c) {
 }
 
 // 一笔核销流水：原始数量、最新有效数量（取最后一次更正目标）与更正链（只增不改）。
-function formatUsage(db, u) {
+// corrections 可选传入（整页状态成批取数时复用预取的更正 Map）；缺省则逐笔查询。
+function formatUsage(db, u, corrections) {
   if (!u) return null;
-  const corrections = db.prepare(
-    `SELECT * FROM label_usage_corrections WHERE usage_id = ? ORDER BY id`
-  ).all(u.id).map(formatCorrection);
+  if (corrections === undefined) {
+    corrections = db.prepare(
+      `SELECT * FROM label_usage_corrections WHERE usage_id = ? ORDER BY id`
+    ).all(u.id);
+  }
+  corrections = corrections.map(formatCorrection);
   const last = corrections.length ? corrections[corrections.length - 1] : null;
   return {
     id: u.id,
@@ -496,6 +500,42 @@ function listUsages(db, rollId) {
   return db.prepare(
     'SELECT * FROM label_roll_usages WHERE roll_id = ? ORDER BY id'
   ).all(rollId).map((u) => formatUsage(db, u));
+}
+
+// 整页状态用：一次取全部核销流水与其更正链，按卷分组（rollId -> 核销数组）。
+// 查询数固定为 2（无流水时更正查询跳过），不随标签卷/核销/更正数量逐笔增长；
+// 每笔形状与 listUsages 逐笔结果一致，且按 id 排序、只含本卷记录，不会串卷。
+function listAllUsagesByRoll(db, rollIds = null) {
+  let sql = 'SELECT * FROM label_roll_usages';
+  const args = [];
+  if (Array.isArray(rollIds) && rollIds.length) {
+    sql += ` WHERE roll_id IN (${rollIds.map(() => '?').join(',')})`;
+    args.push(...rollIds);
+  }
+  sql += ' ORDER BY id';
+  const usageRows = db.prepare(sql).all(...args);
+  const byRoll = new Map();
+  const usageIds = [];
+  for (const u of usageRows) {
+    if (!byRoll.has(u.roll_id)) byRoll.set(u.roll_id, []);
+    byRoll.get(u.roll_id).push(u);
+    usageIds.push(u.id);
+  }
+  const correctionsByUsage = new Map();
+  if (usageIds.length) {
+    const placeholders = usageIds.map(() => '?').join(',');
+    db.prepare(
+      `SELECT * FROM label_usage_corrections WHERE usage_id IN (${placeholders}) ORDER BY id`
+    ).all(...usageIds).forEach((c) => {
+      if (!correctionsByUsage.has(c.usage_id)) correctionsByUsage.set(c.usage_id, []);
+      correctionsByUsage.get(c.usage_id).push(c);
+    });
+  }
+  const result = new Map();
+  for (const [rollId, rows] of byRoll) {
+    result.set(rollId, rows.map((u) => formatUsage(db, u, correctionsByUsage.get(u.id) || [])));
+  }
+  return result;
 }
 
 function formatRoll(r) {
@@ -530,6 +570,7 @@ module.exports = {
   correctUsage,
   getUsage,
   listUsages,
+  listAllUsagesByRoll,
   deactivateForReleaseDeletion,
   deactivateForBatchDeletion,
   syncRollsAfterRecompute,

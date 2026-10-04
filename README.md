@@ -1461,6 +1461,70 @@ curl -s -X POST http://localhost:3000/api/backfills -H 'Content-Type: applicatio
 > 计量是**领用余额**口径，与过敏原推导、放行、标签卷、出货、隔离令等互不影响；
 > 计量写入与事件一样走整次事务，任何非法数量或余额不足都不会留下半成品数据。
 
+## 整页状态读取：成批装配 · 同一时点快照（本轮优化）
+
+车间数据增长后，整页状态接口 `GET /api/state` 仍**一次返回**页面所需的全部记录：
+原料及供应批号（含库存摘要与隔离标注）、设备与事件（含输入与清洗回放）、批次放行
+（含历史快照与失效终态）、标签卷核销及更正链、出货单（含明细快照与当前处置）、
+质量隔离令、停机窗口与库存台账。
+
+- **成批装配，查询数恒定**：供应批号、事件输入、批次放行、核销流水与更正链、出货明细
+  与处置、隔离令生效范围、库存台账（期初/入库/领用/未计量）、停机窗口冲突事件，全部
+  改为**固定数量的 SQL 一次性取全后在内存按主键/外键分组**。整页读取的数据库查询次数
+  **不随事件、标签卷、核销、出货单或供应批号的数量逐笔增长**（在含每类 1/5/30 条关联
+  记录的库上，整页查询均为同样约 30 条 SQL）。
+- **同一时点**：整段状态读取包在**一只读事务（快照）**内执行。即使读取期间有其他请求
+  写入（核销更正、出货、签发/解除隔离令、领用计量等），同一响应中的**核销有效数**
+  （每笔取其更正链最后一条目标值）、**可出货量**（已贴用 − 累计已分配，隔离批次为 0）、
+  **隔离状态**（批次/卷/出货标注）与**库存可用量**（期初 + 入库 − 领用）也必定对应
+  数据库的**同一时点**，不会出现各派生量取自不同版本。
+- **字段、排序与终态语义不变**：响应的顶层字段、各数组排序、放行/出货/更正的历史快照、
+  标签卷**永久停用**（RETIRED，余量冻结、不自动解冻）与出货单/处置的**待评估/需重评**
+  （不自动恢复）等终态语义均与旧版逐笔装配逐字段一致。
+- **边界形状保持**：空库返回各空数组与零值汇总；无关联记录（如卷无核销、单无明细/处置、
+  批号未启用计量、旧输入缺数量）仍按原形状返回 `null`/`0`/空数组；分组均按外键精确归位，
+  **不会把其他卷或其他批次的数据混入**（核销/更正只按 `roll_id`/`usage_id` 归组，出货
+  明细/处置只按 `shipment_id` 归组）。
+
+### HTTP API
+
+| 方法与路径 | 说明 |
+| --- | --- |
+| `GET /api/state` | 整页状态：顶层字段与各项形状不变；服务端改为固定数量 SQL 成批装配，并在同一只读事务（同一时点快照）内返回。现有页面与所有既有字段直接沿用，无需改动调用方 |
+| `GET /api/shipments`、`GET /api/shipments/:idOrCode`、`GET /api/lot-inventory`、`GET /api/quarantine-orders`、`GET /api/downtime-windows`、`GET /api/label-rolls/:id/usages` | 既有形状与排序不变；列表类接口内部同样改为成批装配（明细/处置/范围/台账/冲突事件一次性取全），单据接口保持逐单查询 |
+
+### 调用示例（curl）
+
+```bash
+# 1) 整页状态（一次调用取全所有分区；查询数不随数据量增长，各派生量同一时点）
+curl -s http://localhost:3000/api/state -o state.json
+
+# 2) 校验同一响应内的派生量彼此自洽：卷的“已贴（按更正链有效数）− 已分配 = 可出货”，
+#    且受控批次的卷 shippable_qty 恒为 0、出货单 batch_quarantined 与之同口径
+node -e '
+const s=require("./state.json");
+for (const r of s.label_rolls) {
+  const effApplied = r.usages.reduce((n,u)=>n+u.applied_qty,0);
+  const effVoid    = r.usages.reduce((n,u)=>n+u.void_qty,0);
+  console.log(r.roll_code, "有效贴用", effApplied, "(卷字段", r.applied_qty+")",
+              "已分配", r.allocated_qty, "可出货", r.shippable_qty,
+              "隔离暂停", r.quarantine_paused);
+}
+// 批号库存可用量 = 期初 + 入库 - 领用（未启用计量批号三者为 null/0，旧输入不计领用）
+for (const l of s.lot_inventory)
+  console.log(l.lot_code, l.metered, l.available_qty, "未计量旧输入", l.unmeasured_input_count);'
+
+# 3) 列表类接口形状不变（明细/处置仍随单返回，仅服务端查询方式改为成批）
+curl -s 'http://localhost:3000/api/shipments?status=SHIPPED'
+curl -s 'http://localhost:3000/api/quarantine-orders?status=ACTIVE'
+curl -s http://localhost:3000/api/lot-inventory
+curl -s http://localhost:3000/api/downtime-windows
+```
+
+> 启动方式保持不变：`npm start`（本地）或 `docker compose up --build -d`（容器），
+> 首次启动按 `SEED_DEMO` 决定是否写入演示数据；读优化只影响服务端取数，不改变建库、
+> 播种与任何写入接口。
+
 ## 一键启动（Docker，从空环境开始）
 
 要求安装 Docker 与 Docker Compose（v2）。在项目目录执行：
